@@ -138,3 +138,74 @@ fn test_rate_limit_is_per_user() {
         res.err()
     );
 }
+
+#[test]
+fn transfer_via_token_mover_succeeds() {
+    use helpers::build_mover_transfer_ix;
+
+    let (mut svm, payer, program_id) = setup();
+    let mint = Keypair::new();
+
+    setup_mint_and_extra_metas(&mut svm, &payer, &mint, &program_id);
+
+    let recipient = Keypair::new();
+    svm.airdrop(&recipient.pubkey(), 1_000_000_000).unwrap();
+
+    let source_ata = create_ata(&mut svm, &payer, &payer.pubkey(), &mint.pubkey());
+    let dest_ata = create_ata(&mut svm, &payer, &recipient.pubkey(), &mint.pubkey());
+
+    mint_tokens(&mut svm, &payer, &mint.pubkey(), &source_ata, 1_000_000);
+
+    // Move 100 base units through the second program's CPI into Token-2022.
+    let ix = build_mover_transfer_ix(
+        &source_ata, &dest_ata, &mint.pubkey(), &payer.pubkey(), &program_id, 100, 9,
+    );
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&[ix], Some(&payer.pubkey()), &blockhash);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&payer]).unwrap();
+    let res = svm.send_transaction(tx);
+    assert!(res.is_ok(), "transfer via token-mover should succeed: {:?}", res.err());
+}
+
+#[test]
+fn transfer_via_token_mover_still_enforces_rate_limit() {
+    use helpers::build_mover_transfer_ix;
+
+    let (mut svm, payer, program_id) = setup();
+    let mint = Keypair::new();
+
+    setup_mint_and_extra_metas(&mut svm, &payer, &mint, &program_id);
+
+    let recipient = Keypair::new();
+    svm.airdrop(&recipient.pubkey(), 1_000_000_000).unwrap();
+
+    let source_ata = create_ata(&mut svm, &payer, &payer.pubkey(), &mint.pubkey());
+    let dest_ata = create_ata(&mut svm, &payer, &recipient.pubkey(), &mint.pubkey());
+
+    mint_tokens(&mut svm, &payer, &mint.pubkey(), &source_ata, 2_000_000);
+
+    // Spend the entire budget through the mover program - this must still
+    // trigger the hook and succeed exactly at the cap.
+    let ix1 = build_mover_transfer_ix(
+        &source_ata, &dest_ata, &mint.pubkey(), &payer.pubkey(), &program_id, 1_000_000, 9,
+    );
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&[ix1], Some(&payer.pubkey()), &blockhash);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&payer]).unwrap();
+    let res = svm.send_transaction(tx);
+    assert!(res.is_ok(), "transfer at the cap via token-mover should succeed: {:?}", res.err());
+
+    // One more base unit must be rejected by the hook, proving the hook
+    // genuinely ran inside this program's CPI rather than being skipped.
+    let ix2 = build_mover_transfer_ix(
+        &source_ata, &dest_ata, &mint.pubkey(), &payer.pubkey(), &program_id, 1, 9,
+    );
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&[ix2], Some(&payer.pubkey()), &blockhash);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&payer]).unwrap();
+    let res = svm.send_transaction(tx);
+    assert!(
+        res.is_err(),
+        "transfer over the cap via token-mover must still fail, proving the hook ran"
+    );
+}
